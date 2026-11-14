@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -329,6 +330,14 @@ func sanitizeMihomoDNSConfigForLookup(dnsCfg *mihomoConfig.DNS) {
 	dnsCfg.NameServerPolicy = sanitizeMihomoPolicies(dnsCfg.NameServerPolicy)
 	dnsCfg.ProxyServerPolicy = sanitizeMihomoPolicies(dnsCfg.ProxyServerPolicy)
 
+	// dns.listen is this config's own listener and nothing serves it here, so a
+	// proxy-server-nameserver pointing at it would fail every node lookup.
+	if listen := strings.TrimSpace(dnsCfg.Listen); listen != "" {
+		dnsCfg.ProxyServerNameserver = slices.DeleteFunc(dnsCfg.ProxyServerNameserver, func(ns mihomoDNS.NameServer) bool {
+			return strings.TrimSpace(ns.Addr) == listen
+		})
+	}
+
 	if len(dnsCfg.NameServer) == 0 {
 		switch {
 		case len(dnsCfg.DefaultNameserver) > 0:
@@ -559,6 +568,26 @@ func getCachedMihomoDNSClientFromConfigBytes(configContent []byte) (*MihomoDNSCl
 	return getCachedMihomoDNSClientByHash(cacheKey, configContent)
 }
 
+// hostsDomainTarget returns the domain a `hosts:` entry maps an alias to.
+// mihomo treats such an entry like a CNAME, so the mapped domain has to be
+// resolved instead of the alias itself.
+func (c *MihomoDNSClient) hostsDomainTarget(domain string) string {
+	if c == nil || c.hosts == nil || c.hosts.DomainTrie == nil {
+		return ""
+	}
+
+	domain = strings.TrimRight(strings.TrimSpace(domain), ".")
+	if domain == "" {
+		return ""
+	}
+
+	record, matched := c.hosts.Search(domain, false)
+	if record == nil || matched || !record.IsDomain {
+		return ""
+	}
+	return record.Domain
+}
+
 // lookupHosts resolves a domain straight from the config's `hosts:` section.
 //
 // It mirrors mihomo's dns.withHosts, which is the outermost middleware: a hosts
@@ -622,6 +651,9 @@ func (c *MihomoDNSClient) lookupWithResolver(ctx context.Context, domain string,
 	}
 
 	// hosts entries take precedence over every resolver, as in mihomo.
+	if target := c.hostsDomainTarget(domain); target != "" {
+		return c.lookupWithResolver(ctx, target, resolver)
+	}
 	if ips, ok := c.lookupHosts(domain); ok {
 		return ips, nil
 	}
